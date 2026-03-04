@@ -12,8 +12,9 @@ const cfg = {
   network: env('NETWORK', 'mainnet'),
   symbol: env('SYMBOL', 'Amulet/USDCx'),
   partyId: must('PARTY_ID'),
-  email: must('EMAIL'),
-  password: must('PASSWORD'),
+  email: env('EMAIL'),
+  password: env('PASSWORD'),
+  jwtToken: env('JWT_TOKEN'),
   qty: num('TRADE_QTY', 40),
   sellQty: num('SELL_QTY', 40),
   ccReserve: num('CC_RESERVE', 10),
@@ -191,6 +192,17 @@ function makeSigner(privateKeyHex, partyId) {
 // Previously each 500 ms cycle retried the auth endpoint on every call.
 async function templeLogin() {
   if (state.templeToken && now() - state.templeTokenAt < 10 * 60_000) return state.templeToken;
+
+  // If a static JWT_TOKEN is provided, use it directly — skip the login endpoint.
+  if (cfg.jwtToken) {
+    state.templeToken = cfg.jwtToken;
+    state.templeTokenAt = now();
+    return state.templeToken;
+  }
+
+  if (!cfg.email || !cfg.password) {
+    throw new Error('Missing credentials: set EMAIL+PASSWORD or JWT_TOKEN');
+  }
 
   if (now() < state.loginFailUntil) {
     throw new Error(`Temple login in cooldown — retrying after ${new Date(state.loginFailUntil).toISOString()}`);
