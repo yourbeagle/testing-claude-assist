@@ -60,6 +60,7 @@ const state = {
   templeToken: null,
   templeTokenAt: 0,
   templeLoginPayload: null,
+  jwtInvalidated: false,
   // NEW: if login fails, back off for LOGIN_FAIL_COOLDOWN_MS before retrying.
   // This prevents the 500 ms poll loop from hammering the auth endpoint when
   // credentials are temporarily rejected or the auth service is degraded.
@@ -215,7 +216,9 @@ async function templeLogin() {
   if (state.templeToken && now() - state.templeTokenAt < 10 * 60_000) return state.templeToken;
 
   // If a static JWT_TOKEN is provided, use it directly — skip the login endpoint.
-  if (cfg.jwtToken) {
+  // Skip this fast-path if the token was rejected (401) so we fall through to
+  // email/password re-login instead of replaying the same expired token.
+  if (cfg.jwtToken && !state.jwtInvalidated) {
     state.templeToken = cfg.jwtToken;
     state.templeTokenAt = now();
     // Decode JWT payload to populate templeLoginPayload (needed for userId in buildProposal)
@@ -254,7 +257,8 @@ async function templeLogin() {
     state.templeToken = js.access_token;
     state.templeTokenAt = now();
     state.templeLoginPayload = js;
-    state.loginFailUntil = 0; // clear any previous cooldown on success
+    state.loginFailUntil = 0;
+    state.jwtInvalidated = false;
     persistJwtToEnv(js.access_token);
     return state.templeToken;
   } catch (e) {
@@ -283,6 +287,9 @@ async function templeFetch(path, { method = 'GET', query = null, body = null } =
     if (r.status === 401) {
       state.templeToken = null;
       state.templeTokenAt = 0;
+      state.templeLoginPayload = null;
+      state.jwtInvalidated = true; // force re-login via email/password on next call
+      log('TOKEN_EXPIRED — will re-login on next cycle');
     }
     throw new Error(`${method} ${path} ${r.status} ${txt.slice(0, 180)}`);
   }
