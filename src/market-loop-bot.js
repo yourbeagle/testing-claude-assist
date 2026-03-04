@@ -842,6 +842,10 @@ async function evaluateAndAct(market, oracle, bestBid, bestAsk, knownOrders = nu
     if (gapTicks < cfg.repriceGapTicks) {
       return log(`HOLD ${side} existing @ ${curPrice} (gapTicks=${gapTicks.toFixed(1)})`);
     }
+    const topOfBook = side === 'Buy' ? bestBid : bestAsk;
+    if (topOfBook > 0 && Math.abs(curPrice - topOfBook) <= cfg.tick) {
+      return log(`HOLD ${side} existing @ ${curPrice} (within 1 tick of top-of-book ${topOfBook})`);
+    }
     log(`PLACE_NEW ${side} first target=${target} existing=${curPrice}`);
   }
 
