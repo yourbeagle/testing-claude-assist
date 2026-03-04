@@ -35,7 +35,9 @@ const cfg = {
   waitAppearMs: num('WAIT_APPEAR_MS', 120000),
   pendingHardTimeoutMs: num('PENDING_HARD_TIMEOUT_MS', 600000),
   waitDisappearMs: num('WAIT_DISAPPEAR_MS', 120000),
-  rateLimitBackoffMs: num('RATE_LIMIT_BACKOFF_MS', 70000),
+  // ── reduced default: 20 s instead of 70 s so recovery is faster once the
+  //    root-cause (fewer calls per second) is fixed by the caches below.
+  rateLimitBackoffMs: num('RATE_LIMIT_BACKOFF_MS', 20000),
   mergePauseMs: num('MERGE_PAUSE_MS', 180000),
   minCcRemain: num('MIN_CC_REMAIN', 5),
   minUsdcRemain: num('MIN_USDCX_REMAIN', 1),
@@ -47,21 +49,56 @@ const cfg = {
 const state = {
   inFlight: false,
   lastActionAt: 0,
+
+  // ── Temple auth ──────────────────────────────────────────────────────────
   templeToken: null,
   templeTokenAt: 0,
   templeLoginPayload: null,
+  // NEW: if login fails, back off for LOGIN_FAIL_COOLDOWN_MS before retrying.
+  // This prevents the 500 ms poll loop from hammering the auth endpoint when
+  // credentials are temporarily rejected or the auth service is degraded.
+  loginFailUntil: 0,
+
+  // ── Loop auth ────────────────────────────────────────────────────────────
   loopSession: null,
   loopSessionAt: 0,
+  // NEW: same idea for Loop session auth failures.
+  loopSessionFailUntil: 0,
+
+  // ── Disclosures / misc ───────────────────────────────────────────────────
   disclosures: null,
   disclosuresAt: 0,
+
+  // ── Market data ──────────────────────────────────────────────────────────
   wsOracle: null,
   lastMarket: null,
   lastOracle: null,
   lastBid: null,
   lastAsk: null,
   lastHeartbeatAt: 0,
+
+  // NEW: cache ticker+collar so we don't fire 4 Temple calls per 500 ms cycle.
+  // We only re-fetch when the cache is older than TICKER_CACHE_MS (350 ms —
+  // just under the poll interval so every *other* cycle at most re-fetches).
+  tickerCache: null,
+  tickerCacheAt: 0,
+
+  // ── Orders ───────────────────────────────────────────────────────────────
   knownOrders: new Map(),
   pendingOrder: null,
+
+  // NEW: cache active-orders response for ACTIVE_ORDERS_CACHE_MS (2 s).
+  // monitorOrders() and evaluateAndAct() both call this in the same cycle;
+  // caching avoids the duplicate Temple API hit.
+  activeOrdersCache: null,
+  activeOrdersCacheAt: 0,
+
+  // NEW: cache Loop balances for BALANCES_CACHE_MS (15 s).
+  // getBalances() previously hit the Loop API on every evaluateAndAct() call.
+  // At 500 ms polling this was ~2 calls/sec on the Loop holding endpoint.
+  balancesCache: null,
+  balancesCacheAt: 0,
+
   rateLimitUntil: 0,
   sidePauseUntil: { buy: 0, sell: 0 },
   nextRepriceAt: { buy: 0, sell: 0 },
@@ -69,8 +106,18 @@ const state = {
   dynamicMinQtyAt: 0,
 };
 
+// TTL constants (ms) — tune via env if needed, sensible defaults here.
+const TICKER_CACHE_MS         = num('TICKER_CACHE_MS',        350);
+const ACTIVE_ORDERS_CACHE_MS  = num('ACTIVE_ORDERS_CACHE_MS', 2000);
+const BALANCES_CACHE_MS       = num('BALANCES_CACHE_MS',      15000);
+const LOGIN_FAIL_COOLDOWN_MS  = num('LOGIN_FAIL_COOLDOWN_MS', 30000);
+const LOOP_FAIL_COOLDOWN_MS   = num('LOOP_FAIL_COOLDOWN_MS',  30000);
+// Loop session TTL extended from 4 min → 7 min to cut /apikey call frequency.
+const LOOP_SESSION_TTL_MS     = num('LOOP_SESSION_TTL_MS',    7 * 60_000);
+
 const signer = makeSigner(parsePrivateKey(), cfg.partyId);
 
+// ── tiny helpers ─────────────────────────────────────────────────────────────
 function env(k, d = '') { return process.env[k]?.trim() || d; }
 function must(k) {
   const v = env(k);
@@ -124,20 +171,40 @@ function makeSigner(privateKeyHex, partyId) {
   };
 }
 
+// ── Temple login ─────────────────────────────────────────────────────────────
+// FIX: if a login attempt fails we set loginFailUntil so every subsequent call
+// within LOGIN_FAIL_COOLDOWN_MS throws immediately without hitting the network.
+// Previously each 500 ms cycle retried the auth endpoint on every call.
 async function templeLogin() {
   if (state.templeToken && now() - state.templeTokenAt < 10 * 60_000) return state.templeToken;
-  const r = await ffetch(`${API}/auth/login`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ email: cfg.email, password: cfg.password }),
-  });
-  const txt = await r.text();
-  const js = txt ? JSON.parse(txt) : {};
-  if (!r.ok || !js.access_token) throw new Error(`Temple login failed: ${r.status}`);
-  state.templeToken = js.access_token;
-  state.templeTokenAt = now();
-  state.templeLoginPayload = js;
-  return state.templeToken;
+
+  if (now() < state.loginFailUntil) {
+    throw new Error(`Temple login in cooldown — retrying after ${new Date(state.loginFailUntil).toISOString()}`);
+  }
+
+  try {
+    const r = await ffetch(`${API}/auth/login`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ email: cfg.email, password: cfg.password }),
+    });
+    const txt = await r.text();
+    const js = txt ? JSON.parse(txt) : {};
+    if (!r.ok || !js.access_token) {
+      throw new Error(`Temple login failed: ${r.status} ${txt.slice(0, 120)}`);
+    }
+    state.templeToken = js.access_token;
+    state.templeTokenAt = now();
+    state.templeLoginPayload = js;
+    state.loginFailUntil = 0; // clear any previous cooldown on success
+    return state.templeToken;
+  } catch (e) {
+    // On any error (network, 401, 5xx) back off before next attempt.
+    state.templeToken = null;
+    state.loginFailUntil = now() + LOGIN_FAIL_COOLDOWN_MS;
+    log(`LOGIN_FAIL cooldown ${LOGIN_FAIL_COOLDOWN_MS / 1000}s: ${e.message}`);
+    throw e;
+  }
 }
 
 async function templeFetch(path, { method = 'GET', query = null, body = null } = {}) {
@@ -151,37 +218,76 @@ async function templeFetch(path, { method = 'GET', query = null, body = null } =
   });
   const txt = await r.text();
   const js = txt ? JSON.parse(txt) : {};
-  if (!r.ok) throw new Error(`${method} ${path} ${r.status} ${txt.slice(0, 180)}`);
+  if (!r.ok) {
+    // If 401 clear cached token so next call re-authenticates properly instead
+    // of replaying a stale Bearer token on every single retry.
+    if (r.status === 401) {
+      state.templeToken = null;
+      state.templeTokenAt = 0;
+    }
+    throw new Error(`${method} ${path} ${r.status} ${txt.slice(0, 180)}`);
+  }
   return js;
 }
 
+// ── Loop session ─────────────────────────────────────────────────────────────
+// FIX: extended TTL to 7 min + failure cooldown mirrors the Temple auth fix.
 async function getLoopSession() {
-  if (state.loopSession && now() - state.loopSessionAt < 4 * 60_000) return state.loopSession;
+  if (state.loopSession && now() - state.loopSessionAt < LOOP_SESSION_TTL_MS) return state.loopSession;
+
+  if (now() < state.loopSessionFailUntil) {
+    throw new Error(`Loop session in cooldown — retrying after ${new Date(state.loopSessionFailUntil).toISOString()}`);
+  }
+
   let epoch = Date.now();
   for (let i = 0; i < 3; i++) {
-    const signature = signer.signMessageAsHex(`Exchange API Key for ${cfg.partyId}\nTimestamp: ${epoch}`);
-    const r = await ffetch(`${LOOP}/api/v1/.connect/pair/apikey`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ public_key: signer.publicKeyHex, signature, epoch }),
-    });
-    const txt = await r.text();
-    if (r.ok) {
-      state.loopSession = JSON.parse(txt);
-      state.loopSessionAt = now();
-      return state.loopSession;
+    try {
+      const signature = signer.signMessageAsHex(`Exchange API Key for ${cfg.partyId}\nTimestamp: ${epoch}`);
+      const r = await ffetch(`${LOOP}/api/v1/.connect/pair/apikey`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ public_key: signer.publicKeyHex, signature, epoch }),
+      });
+      const txt = await r.text();
+
+      if (r.ok) {
+        state.loopSession = JSON.parse(txt);
+        state.loopSessionAt = now();
+        state.loopSessionFailUntil = 0; // clear cooldown on success
+        return state.loopSession;
+      }
+
+      if (txt.includes('expired epoch')) {
+        const o = await ffetch(`${LOOP}/api/v1/.connect/pair/apikey`, { method: 'OPTIONS' });
+        epoch = new Date(o.headers.get('date')).getTime();
+        continue; // retry with corrected epoch
+      }
+
+      throw new Error(`Loop apikey failed: ${r.status} ${txt.slice(0, 160)}`);
+    } catch (e) {
+      if (i === 2) {
+        // All 3 attempts failed — set cooldown so we stop hammering.
+        state.loopSession = null;
+        state.loopSessionAt = 0;
+        state.loopSessionFailUntil = now() + LOOP_FAIL_COOLDOWN_MS;
+        log(`LOOP_SESSION_FAIL cooldown ${LOOP_FAIL_COOLDOWN_MS / 1000}s: ${e.message}`);
+        throw e;
+      }
+      // Short pause before next attempt within the 3-retry window.
+      await sleep(500);
     }
-    if (txt.includes('expired epoch')) {
-      const o = await ffetch(`${LOOP}/api/v1/.connect/pair/apikey`, { method: 'OPTIONS' });
-      epoch = new Date(o.headers.get('date')).getTime();
-      continue;
-    }
-    throw new Error(`Loop apikey failed: ${r.status} ${txt.slice(0, 160)}`);
   }
   throw new Error('Loop apikey failed after retries');
 }
 
+// ── Balances (Loop API) ───────────────────────────────────────────────────────
+// FIX: cached for BALANCES_CACHE_MS (15 s) — was called uncached on every
+// evaluateAndAct() = up to 2 Loop API calls per second at 500 ms polling.
 async function getBalances() {
+  if (state.balancesCache && now() - state.balancesCacheAt < BALANCES_CACHE_MS) {
+    return state.balancesCache;
+  }
+
   const fetchHoldings = async () => {
     const s = await getLoopSession();
     const r = await ffetch(`${LOOP}/api/v1/.connect/pair/account/holding`, {
@@ -197,7 +303,7 @@ async function getBalances() {
   try {
     holdings = await fetchHoldings();
   } catch (e) {
-    // refresh loop session once and retry
+    // Refresh loop session once and retry (original behaviour kept).
     state.loopSession = null;
     state.loopSessionAt = 0;
     holdings = await fetchHoldings();
@@ -206,7 +312,67 @@ async function getBalances() {
   const pick = (id) => (holdings || []).find((h) => String(h?.instrument_id?.id || '').toUpperCase() === id.toUpperCase());
   const cc = Number(pick('Amulet')?.total_unlocked_coin || 0);
   const usdcx = Number(pick('USDCx')?.total_unlocked_coin || 0);
-  return { cc, usdcx };
+  const result = { cc, usdcx };
+  state.balancesCache = result;
+  state.balancesCacheAt = now();
+  return result;
+}
+
+// ── Active orders (Temple API) ────────────────────────────────────────────────
+// FIX: cached for ACTIVE_ORDERS_CACHE_MS (2 s).
+// Both monitorOrders() and evaluateAndAct() called getActiveOrders() in the
+// same 500 ms cycle — this deduplicates that into at most 1 call per 2 s.
+async function getActiveOrders() {
+  if (state.activeOrdersCache && now() - state.activeOrdersCacheAt < ACTIVE_ORDERS_CACHE_MS) {
+    return state.activeOrdersCache;
+  }
+  const js = await templeFetch('/api/trading/orders/active', { query: { symbol: cfg.symbol, limit: 50 } });
+  const orders = js.orders || [];
+  state.activeOrdersCache = orders;
+  state.activeOrdersCacheAt = now();
+  return orders;
+}
+
+// ── Ticker + collar (Temple API) ──────────────────────────────────────────────
+// FIX: cached for TICKER_CACHE_MS (350 ms) — was 4 parallel Temple calls fired
+// on every single 500 ms cycle even when nothing changed.
+async function getTickerAndCollar() {
+  if (state.tickerCache && now() - state.tickerCacheAt < TICKER_CACHE_MS) {
+    return state.tickerCache;
+  }
+
+  const [ticker, collar, orderbook, oracleResp] = await Promise.all([
+    templeFetch('/api/public/market/ticker', { query: { symbol: cfg.symbol } }),
+    templeFetch('/api/public/market/order-collar'),
+    templeFetch('/api/public/market/orderbook', { query: { symbol: cfg.symbol, precision: 4 } }),
+    templeFetch('/api/crypto/oracle'),
+  ]);
+
+  const ob = orderbook?.orderbook || orderbook || {};
+  const rawBestBid = Number(ob?.best_bid || (Array.isArray(ob?.bids) && ob.bids[0] ? (ob.bids[0].price ?? ob.bids[0][0]) : 0) || 0);
+  const rawBestAsk = Number(ob?.best_ask || (Array.isArray(ob?.asks) && ob.asks[0] ? (ob.asks[0].price ?? ob.asks[0][0]) : 0) || 0);
+  let bestBid = rawBestBid;
+  let bestAsk = rawBestAsk;
+
+  const market = Number(ticker?.ticker?.last_price || 0);
+  if (bestBid > 0 && bestAsk > 0 && bestAsk <= bestBid) {
+    bestBid = round4(Math.max(0, market - cfg.tick));
+    bestAsk = round4(market + cfg.tick);
+  }
+
+  const result = {
+    market,
+    oracle: Number(oracleResp?.prices?.cc || 0),
+    oracleProxy: Number(ticker?.ticker?.vwap_24h || ticker?.ticker?.close_24h || ticker?.ticker?.last_price || 0),
+    bestBid,
+    bestAsk,
+    rawBestBid,
+    rawBestAsk,
+    collar: Number(collar?.percentage || 0.001),
+  };
+  state.tickerCache = result;
+  state.tickerCacheAt = now();
+  return result;
 }
 
 async function mergeHoldings(instrumentId = 'USDCx') {
@@ -224,7 +390,7 @@ async function mergeHoldings(instrumentId = 'USDCx') {
   if (!Number.isFinite(amount) || amount <= 0) throw new Error(`merge: no unlocked ${instrumentId}`);
 
   const fmtZ = (d) => new Date(d).toISOString().replace(/\.\d{3}Z$/, '.000Z');
-  const reqAt = Date.now() - 2 * 60_000; // avoid ledger-time skew issues
+  const reqAt = Date.now() - 2 * 60_000;
   const payloadReq = {
     recipient: cfg.partyId,
     amount: amount.toFixed(10),
@@ -246,6 +412,9 @@ async function mergeHoldings(instrumentId = 'USDCx') {
   const submit = await submitLoopCommand(prepJs.payload);
   log(`MERGE submitted instrument=${instrumentId} amount=${amount} command=${submit?.command_id || '-'}`);
   state.sidePauseUntil.buy = now() + cfg.mergePauseMs;
+  // Invalidate balance cache after a merge so next evaluateAndAct sees fresh values.
+  state.balancesCache = null;
+  state.balancesCacheAt = 0;
   return submit;
 }
 
@@ -255,44 +424,6 @@ async function getDisclosures() {
   state.disclosures = js?.disclosures?.choiceContext?.disclosedContracts || [];
   state.disclosuresAt = now();
   return state.disclosures;
-}
-
-async function getTickerAndCollar() {
-  const [ticker, collar, orderbook, oracleResp] = await Promise.all([
-    templeFetch('/api/public/market/ticker', { query: { symbol: cfg.symbol } }),
-    templeFetch('/api/public/market/order-collar'),
-    templeFetch('/api/public/market/orderbook', { query: { symbol: cfg.symbol, precision: 4 } }),
-    templeFetch('/api/crypto/oracle'),
-  ]);
-
-  const ob = orderbook?.orderbook || orderbook || {};
-  const rawBestBid = Number(ob?.best_bid || (Array.isArray(ob?.bids) && ob.bids[0] ? (ob.bids[0].price ?? ob.bids[0][0]) : 0) || 0);
-  const rawBestAsk = Number(ob?.best_ask || (Array.isArray(ob?.asks) && ob.asks[0] ? (ob.asks[0].price ?? ob.asks[0][0]) : 0) || 0);
-  let bestBid = rawBestBid;
-  let bestAsk = rawBestAsk;
-
-  const market = Number(ticker?.ticker?.last_price || 0);
-  if (bestBid > 0 && bestAsk > 0 && bestAsk <= bestBid) {
-    // sanitize inverted book snapshot for pricing, but keep raw for housekeeping
-    bestBid = round4(Math.max(0, market - cfg.tick));
-    bestAsk = round4(market + cfg.tick);
-  }
-
-  return {
-    market,
-    oracle: Number(oracleResp?.prices?.cc || 0),
-    oracleProxy: Number(ticker?.ticker?.vwap_24h || ticker?.ticker?.close_24h || ticker?.ticker?.last_price || 0),
-    bestBid,
-    bestAsk,
-    rawBestBid,
-    rawBestAsk,
-    collar: Number(collar?.percentage || 0.001),
-  };
-}
-
-async function getActiveOrders() {
-  const js = await templeFetch('/api/trading/orders/active', { query: { symbol: cfg.symbol, limit: 50 } });
-  return js.orders || [];
 }
 
 async function getDynamicMinQty() {
@@ -323,6 +454,7 @@ function orderKey(o) {
 }
 
 async function monitorOrders() {
+  // Uses the cached getActiveOrders() — no extra Temple API call if cache is fresh.
   const orders = await getActiveOrders();
   const currentIds = new Set(orders.map((o) => o.order_id));
 
@@ -350,7 +482,6 @@ async function monitorOrders() {
 
   if (state.pendingOrder && now() - state.pendingOrder.at > cfg.waitAppearMs) {
     log(`PENDING_TIMEOUT side=${state.pendingOrder.side} price=${state.pendingOrder.price} qty=${state.pendingOrder.qty} (hold gate)`);
-    // keep pending gate to avoid duplicate submissions; only release on hard timeout
     if (now() - state.pendingOrder.at > cfg.pendingHardTimeoutMs) {
       log(`PENDING_HARD_TIMEOUT release gate side=${state.pendingOrder.side} price=${state.pendingOrder.price}`);
       state.pendingOrder = null;
@@ -373,6 +504,8 @@ async function monitorOrders() {
 async function waitOrderVisible(expect = null, timeoutMs = cfg.waitAppearMs) {
   const deadline = now() + timeoutMs;
   while (now() < deadline) {
+    // Bypass cache here — we need real-time visibility confirmation.
+    state.activeOrdersCache = null;
     const orders = await getActiveOrders();
     if (!expect) {
       if (orders.length > 0) return orders[0];
@@ -394,6 +527,7 @@ async function waitOrderVisible(expect = null, timeoutMs = cfg.waitAppearMs) {
 async function waitOrderGone(orderId, timeoutMs = cfg.waitDisappearMs) {
   const deadline = now() + timeoutMs;
   while (now() < deadline) {
+    state.activeOrdersCache = null; // bypass cache for real-time check
     const orders = await getActiveOrders();
     const exists = orders.some((o) => o.order_id === orderId);
     if (!exists) return true;
@@ -457,7 +591,6 @@ function decideSide(market, oracle, bestBid = 0, bestAsk = 0) {
   if (market > oracle) return 'Sell';
   if (market < oracle) return 'Buy';
 
-  // market == oracle: choose any side that can be top-of-book
   const sellCandidate = round4(Math.min(oracle - cfg.tick, (bestAsk > 0 ? bestAsk : oracle) - cfg.tick));
   const buyCandidate = round4(oracle + 2 * cfg.tick);
   const topSell = bestAsk > 0 ? round4(bestAsk - cfg.tick) : null;
@@ -470,13 +603,10 @@ function decideSide(market, oracle, bestBid = 0, bestAsk = 0) {
 
 function targetPrice(side, market, oracle, bestBid = 0, bestAsk = 0) {
   if (side === 'Sell') {
-    // Always be cheapest ask while still tracking oracle move
     const byOracle = round4(oracle - 1 * cfg.tick);
     const byBook = round4((bestAsk > 0 ? bestAsk : market) - cfg.tick);
     return round4(Math.min(byOracle, byBook));
   }
-
-  // Buy remains oracle-capped as agreed
   return round4(oracle + 2 * cfg.tick);
 }
 
@@ -525,6 +655,9 @@ async function placeLimit(side, price, quantity) {
   }
   const command = await buildProposal(side, price, quantity);
   const sub = await submitLoopCommand(command);
+  // Invalidate order cache so next monitorOrders() sees fresh state.
+  state.activeOrdersCache = null;
+  state.activeOrdersCacheAt = 0;
   log(`[LIVE] submitted ${side} ${quantity} @ ${price} command=${sub?.command_id || '-'} submission=${sub?.submission_id || '-'}`);
   return sub;
 }
@@ -543,7 +676,7 @@ async function evaluateAndAct(market, oracle, bestBid, bestAsk, knownOrders = nu
 
   const sellPrice = targetPrice('Sell', market, oracle, bestBid, bestAsk);
   const buyPrice = targetPrice('Buy', market, oracle, bestBid, bestAsk);
-  const balances = await getBalances();
+  const balances = await getBalances(); // now cached — no extra Loop API hit
 
   const minQty = await getDynamicMinQty();
 
@@ -552,7 +685,7 @@ async function evaluateAndAct(market, oracle, bestBid, bestAsk, knownOrders = nu
   const canSell = sellPrice != null && sellQtyDyn >= minQty;
 
   const buyQtyByBalance = buyPrice && buyPrice > 0 ? (balances.usdcx / buyPrice) : 0;
-  const buyQty = round4(buyQtyByBalance * cfg.buyBalancePct); // partial allocation per order
+  const buyQty = round4(buyQtyByBalance * cfg.buyBalancePct);
   const canBuy = buyPrice != null && buyQty >= minQty;
 
   let side = signalSide;
@@ -579,7 +712,6 @@ async function evaluateAndAct(market, oracle, bestBid, bestAsk, knownOrders = nu
 
   const target = side === 'Sell' ? sellPrice : buyPrice;
 
-  // HARD ORDERBOOK GATE: never place if we are visibly not top-of-book at decision time.
   const topBuy = bestBid > 0 ? round4(bestBid + cfg.tick) : null;
   const topSell = bestAsk > 0 ? round4(bestAsk - cfg.tick) : null;
   if (side === 'Buy' && topBuy != null && target < topBuy) {
@@ -599,9 +731,6 @@ async function evaluateAndAct(market, oracle, bestBid, bestAsk, knownOrders = nu
     return log(`KEEP ${side} order @ ${target}`);
   }
 
-  // SELL policy requested:
-  // - if oracle rises (new target higher), keep older lower sell (do not cancel)
-  // - if oracle drops (new target lower), place new lower sell then cancel higher old sells
   if (side === 'Sell' && sameSide.length > 0) {
     const prices = sameSide.map((o) => Number(o.price)).filter((n) => Number.isFinite(n));
     const lowestExisting = Math.min(...prices);
@@ -610,9 +739,7 @@ async function evaluateAndAct(market, oracle, bestBid, bestAsk, knownOrders = nu
     }
   }
 
-  // Prefer placing a new quote first; cancel old quotes later by rule.
   if (cfg.maxOrdersPerSide > 0 && sameSide.length >= cfg.maxOrdersPerSide) {
-    // Special case: allow one-step improve for SELL (lower target), then clean higher old orders.
     if (!(side === 'Sell' && sameSide.length > 0 && target < Math.min(...sameSide.map((o) => Number(o.price)).filter((n) => Number.isFinite(n))))) {
       return log(`HOLD ${side}: maxOrdersPerSide=${cfg.maxOrdersPerSide} reached, skip new place`);
     }
@@ -633,11 +760,9 @@ async function evaluateAndAct(market, oracle, bestBid, bestAsk, knownOrders = nu
     state.lastActionAt = now();
 
     if (!cfg.dryRun) {
-      // non-blocking: set pending and let monitor loop confirm visibility
       state.pendingOrder = { side, price: target, qty: targetQty, at: now() };
       log('ORDER submitted; visibility will be checked asynchronously by monitor loop');
 
-      // For SELL improvement: after placing lower sell, cancel older higher sell orders
       if (side === 'Sell' && sameSide.length > 0) {
         for (const o of sameSide) {
           const p = Number(o.price || 0);
@@ -668,7 +793,6 @@ async function evaluateAndAct(market, oracle, bestBid, bestAsk, knownOrders = nu
   }
 }
 
-
 function startOracleWs() {
   const ws = new WebSocket('wss://ws.templedigitalgroup.com/v1/stream', {
     headers: { Origin: 'https://app.templedigitalgroup.com' },
@@ -697,8 +821,8 @@ async function cycle() {
   state.inFlight = true;
   try {
     const [mkt, orders] = await Promise.all([
-      getTickerAndCollar(),
-      monitorOrders(),
+      getTickerAndCollar(),  // cached — re-fetches at most every TICKER_CACHE_MS
+      monitorOrders(),       // uses cached getActiveOrders() — at most every ACTIVE_ORDERS_CACHE_MS
     ]);
 
     const market = mkt.market;
@@ -707,9 +831,6 @@ async function cycle() {
     const bestAsk = mkt.bestAsk || 0;
     const hbBid = mkt.rawBestBid || bestBid;
     const hbAsk = mkt.rawBestAsk || bestAsk;
-
-    // housekeeping is conservative: do not auto-cancel just because not top.
-    // cancellation is handled by strategy branch (e.g. when placing improved price).
 
     const marketChanged = state.lastMarket == null || market !== state.lastMarket;
     const bookChanged = state.lastBid == null || state.lastAsk == null || bestBid !== state.lastBid || bestAsk !== state.lastAsk;
@@ -727,7 +848,6 @@ async function cycle() {
     } else if (heartbeatDue) {
       state.lastHeartbeatAt = now();
       log(`HEARTBEAT market=${market} oracle=${oracle} bid=${bestBid} ask=${bestAsk} activeOrders=${orders.length} pending=${state.pendingOrder ? 'yes' : 'no'}`);
-      // keep bot from getting "stuck" even without tick changes
       await evaluateAndAct(market, oracle, bestBid, bestAsk, orders);
     }
   } catch (e) {
@@ -739,6 +859,8 @@ async function cycle() {
 
 async function main() {
   log(`Start loop-bot symbol=${cfg.symbol} dryRun=${cfg.dryRun} pollMs=${cfg.pollMs} heartbeatMs=${cfg.heartbeatMs}`);
+  log(`Cache TTLs — ticker:${TICKER_CACHE_MS}ms  activeOrders:${ACTIVE_ORDERS_CACHE_MS}ms  balances:${BALANCES_CACHE_MS}ms  loopSession:${LOOP_SESSION_TTL_MS / 1000}s`);
+  log(`Cooldowns  — loginFail:${LOGIN_FAIL_COOLDOWN_MS / 1000}s  loopFail:${LOOP_FAIL_COOLDOWN_MS / 1000}s  rateLimit:${cfg.rateLimitBackoffMs / 1000}s`);
   startOracleWs();
   await cycle();
   if (cfg.runOnce) return;
