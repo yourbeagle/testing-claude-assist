@@ -218,6 +218,17 @@ async function templeLogin() {
   if (cfg.jwtToken) {
     state.templeToken = cfg.jwtToken;
     state.templeTokenAt = now();
+    // Decode JWT payload to populate templeLoginPayload (needed for userId in buildProposal)
+    if (!state.templeLoginPayload) {
+      try {
+        const payloadB64 = cfg.jwtToken.split('.')[1];
+        const decoded = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+        const userId = decoded.user_id || decoded.sub || decoded.id || '';
+        state.templeLoginPayload = { user: { user_id: userId } };
+      } catch {
+        state.templeLoginPayload = { user: { user_id: '' } };
+      }
+    }
     return state.templeToken;
   }
 
