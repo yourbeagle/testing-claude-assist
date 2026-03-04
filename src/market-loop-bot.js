@@ -681,12 +681,16 @@ function decideSide(market, oracle, bestBid = 0, bestAsk = 0) {
 }
 
 function targetPrice(side, market, oracle, bestBid = 0, bestAsk = 0) {
+  // Snap oracle to 4dp (tick grid) first. If oracle has 5+ decimal places
+  // (e.g. 0.52525 from WS feed), toFixed(4) inside round4 would round the
+  // 5th decimal UP, pushing the limit price 1 extra tick away from oracle.
+  const o = Math.round(oracle * 10000) / 10000;
   if (side === 'Sell') {
-    const byOracle = round4(oracle - 1 * cfg.tick);
+    const byOracle = round4(o - 1 * cfg.tick);
     const byBook = round4((bestAsk > 0 ? bestAsk : market) - cfg.tick);
     return round4(Math.min(byOracle, byBook));
   }
-  return round4(oracle + 2 * cfg.tick);
+  return round4(o + 2 * cfg.tick);
 }
 
 function isStale(order, side, target) {
