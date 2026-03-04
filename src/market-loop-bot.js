@@ -1,5 +1,8 @@
 import 'dotenv/config';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import WebSocket from 'ws';
 import * as _forge from 'node-forge';
 import { initializeConfig, createOrderProposal } from '@temple-digital-group/temple-canton-js';
@@ -57,6 +60,7 @@ const state = {
   templeToken: null,
   templeTokenAt: 0,
   templeLoginPayload: null,
+  jwtInvalidated: false,
   // NEW: if login fails, back off for LOGIN_FAIL_COOLDOWN_MS before retrying.
   // This prevents the 500 ms poll loop from hammering the auth endpoint when
   // credentials are temporarily rejected or the auth service is degraded.
@@ -190,13 +194,44 @@ function makeSigner(privateKeyHex, partyId) {
 // FIX: if a login attempt fails we set loginFailUntil so every subsequent call
 // within LOGIN_FAIL_COOLDOWN_MS throws immediately without hitting the network.
 // Previously each 500 ms cycle retried the auth endpoint on every call.
+function persistJwtToEnv(token) {
+  try {
+    const envPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.env');
+    if (!fs.existsSync(envPath)) return;
+    let content = fs.readFileSync(envPath, 'utf8');
+    if (/^JWT_TOKEN=.*$/m.test(content)) {
+      content = content.replace(/^JWT_TOKEN=.*$/m, `JWT_TOKEN=${token}`);
+    } else {
+      content += `\nJWT_TOKEN=${token}\n`;
+    }
+    fs.writeFileSync(envPath, content, 'utf8');
+    cfg.jwtToken = token;
+    log('JWT_TOKEN saved to .env');
+  } catch (e) {
+    log(`WARN: could not save JWT_TOKEN to .env: ${e.message}`);
+  }
+}
+
 async function templeLogin() {
   if (state.templeToken && now() - state.templeTokenAt < 10 * 60_000) return state.templeToken;
 
   // If a static JWT_TOKEN is provided, use it directly — skip the login endpoint.
-  if (cfg.jwtToken) {
+  // Skip this fast-path if the token was rejected (401) so we fall through to
+  // email/password re-login instead of replaying the same expired token.
+  if (cfg.jwtToken && !state.jwtInvalidated) {
     state.templeToken = cfg.jwtToken;
     state.templeTokenAt = now();
+    // Decode JWT payload to populate templeLoginPayload (needed for userId in buildProposal)
+    if (!state.templeLoginPayload) {
+      try {
+        const payloadB64 = cfg.jwtToken.split('.')[1];
+        const decoded = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
+        const userId = decoded.user_id || decoded.sub || decoded.id || '';
+        state.templeLoginPayload = { user: { user_id: userId } };
+      } catch {
+        state.templeLoginPayload = { user: { user_id: '' } };
+      }
+    }
     return state.templeToken;
   }
 
@@ -222,7 +257,9 @@ async function templeLogin() {
     state.templeToken = js.access_token;
     state.templeTokenAt = now();
     state.templeLoginPayload = js;
-    state.loginFailUntil = 0; // clear any previous cooldown on success
+    state.loginFailUntil = 0;
+    state.jwtInvalidated = false;
+    persistJwtToEnv(js.access_token);
     return state.templeToken;
   } catch (e) {
     // On any error (network, 401, 5xx) back off before next attempt.
@@ -250,6 +287,9 @@ async function templeFetch(path, { method = 'GET', query = null, body = null } =
     if (r.status === 401) {
       state.templeToken = null;
       state.templeTokenAt = 0;
+      state.templeLoginPayload = null;
+      state.jwtInvalidated = true; // force re-login via email/password on next call
+      log('TOKEN_EXPIRED — will re-login on next cycle');
     }
     throw new Error(`${method} ${path} ${r.status} ${txt.slice(0, 180)}`);
   }
