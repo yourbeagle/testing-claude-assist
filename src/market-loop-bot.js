@@ -111,6 +111,7 @@ const state = {
   collarCacheAt: 0,
   oracleRestCache: null,
   oracleRestCacheAt: 0,
+  lastMergeCheckAt: 0,
 
   rateLimitUntil: 0,
   sidePauseUntil: { buy: 0, sell: 0 },
@@ -375,9 +376,32 @@ async function getBalances() {
     holdings = await fetchHoldings();
   }
 
-  const pick = (id) => (holdings || []).find((h) => String(h?.instrument_id?.id || '').toUpperCase() === id.toUpperCase());
-  const cc = Number(pick('Amulet')?.total_unlocked_coin || 0);
-  const usdcx = Number(pick('USDCx')?.total_unlocked_coin || 0);
+  // Sum across ALL entries for each instrument — holdings can be fragmented into
+  // multiple contract instances, so .find() would undercount the true balance.
+  const filterById = (id) => (holdings || []).filter((h) => String(h?.instrument_id?.id || '').toUpperCase() === id.toUpperCase());
+  const sumUnlocked = (id) => filterById(id).reduce((s, h) => s + Number(h.total_unlocked_coin || 0), 0);
+
+  const cc = sumUnlocked('Amulet');
+  const usdcx = sumUnlocked('USDCx');
+
+  // Proactive fragmentation check: if any instrument has multiple holding entries
+  // the validator will reject orders ("needs to merge"). Detect and merge in the
+  // background every MERGE_CHECK_INTERVAL_MS so the issue never reaches order time.
+  const MERGE_CHECK_INTERVAL_MS = 5 * 60_000; // 5 minutes
+  if (now() - state.lastMergeCheckAt > MERGE_CHECK_INTERVAL_MS) {
+    state.lastMergeCheckAt = now();
+    const amuletFragments = filterById('Amulet').length;
+    const usdcxFragments = filterById('USDCx').length;
+    if (amuletFragments > 1) {
+      log(`PROACTIVE_MERGE Amulet: ${amuletFragments} fragments detected, merging in background`);
+      mergeHoldings('Amulet').catch((e) => log(`PROACTIVE_MERGE Amulet failed: ${e.message}`));
+    }
+    if (usdcxFragments > 1) {
+      log(`PROACTIVE_MERGE USDCx: ${usdcxFragments} fragments detected, merging in background`);
+      mergeHoldings('USDCx').catch((e) => log(`PROACTIVE_MERGE USDCx failed: ${e.message}`));
+    }
+  }
+
   const result = { cc, usdcx };
   state.balancesCache = result;
   state.balancesCacheAt = now();
@@ -479,12 +503,17 @@ async function mergeHoldings(instrumentId = 'USDCx') {
   const holdings = await r.json();
   if (!r.ok) throw new Error(`holding failed for merge: ${r.status}`);
 
-  const item = (holdings || []).find((h) => String(h?.instrument_id?.id || '').toUpperCase() === instrumentId.toUpperCase());
-  if (!item) throw new Error(`merge: instrument ${instrumentId} not found`);
+  // Collect ALL entries for this instrument (holdings can be fragmented across
+  // multiple contract instances — find() would only pick the first one).
+  const items = (holdings || []).filter((h) => String(h?.instrument_id?.id || '').toUpperCase() === instrumentId.toUpperCase());
+  if (!items.length) throw new Error(`merge: instrument ${instrumentId} not found`);
 
-  const amount = Number(item.total_unlocked_coin || 0);
+  // Sum total unlocked across all fragments for the merge amount.
+  const amount = items.reduce((s, h) => s + Number(h.total_unlocked_coin || 0), 0);
   if (!Number.isFinite(amount) || amount <= 0) throw new Error(`merge: no unlocked ${instrumentId}`);
 
+  // Use metadata from the first entry (admin / id are the same across fragments).
+  const item = items[0];
   const fmtZ = (d) => new Date(d).toISOString().replace(/\.\d{3}Z$/, '.000Z');
   const reqAt = Date.now() - 2 * 60_000;
   const payloadReq = {
@@ -506,9 +535,17 @@ async function mergeHoldings(instrumentId = 'USDCx') {
   if (!prep.ok || !prepJs?.payload) throw new Error(`merge prepare failed ${prep.status} ${prepTxt.slice(0, 180)}`);
 
   const submit = await submitLoopCommand(prepJs.payload);
-  log(`MERGE submitted instrument=${instrumentId} amount=${amount} command=${submit?.command_id || '-'}`);
-  state.sidePauseUntil.buy = now() + cfg.mergePauseMs;
-  // Invalidate balance cache after a merge so next evaluateAndAct sees fresh values.
+  log(`MERGE submitted instrument=${instrumentId} amount=${amount} fragments=${items.length} command=${submit?.command_id || '-'}`);
+
+  // Pause the correct trading side: Amulet (CC) is needed for Sell, USDCx for Buy.
+  const isAmulet = instrumentId.toUpperCase() === 'AMULET';
+  if (isAmulet) {
+    state.sidePauseUntil.sell = now() + cfg.mergePauseMs;
+  } else {
+    state.sidePauseUntil.buy = now() + cfg.mergePauseMs;
+  }
+
+  // Invalidate balance cache so next evaluateAndAct sees fresh values.
   state.balancesCache = null;
   state.balancesCacheAt = 0;
   return submit;
@@ -899,13 +936,26 @@ async function evaluateAndAct(market, oracle, bestBid, bestAsk, knownOrders = nu
       log(`BACKOFF rate-limit applied for ${Math.round(cfg.rateLimitBackoffMs / 1000)}s`);
       return;
     }
-    if (msg.toLowerCase().includes('needs to merge his holdings')) {
-      log('MERGE required by validator, trying self-transfer merge for USDCx...');
-      try {
-        await mergeHoldings('USDCx');
-      } catch (merr) {
-        log(`MERGE failed: ${merr.message}`);
-        state.sidePauseUntil.buy = now() + cfg.mergePauseMs;
+    if (msg.toLowerCase().includes('needs to merge his holdings') || msg.toLowerCase().includes('no suitable holding found') || msg.toLowerCase().includes('no single holding found')) {
+      // Merge the instrument that the failing side requires:
+      //   Sell needs Amulet (CC), Buy needs USDCx.
+      // Merge both to clear any fragmentation on either side.
+      const mergeTargets = side === 'Sell'
+        ? ['Amulet', 'USDCx']   // Amulet first — that's what's needed for sell
+        : ['USDCx', 'Amulet'];  // USDCx first — that's what's needed for buy
+      log(`MERGE required by validator (side=${side}), merging ${mergeTargets.join(' + ')}...`);
+      for (const inst of mergeTargets) {
+        try {
+          await mergeHoldings(inst);
+        } catch (merr) {
+          log(`MERGE ${inst} failed: ${merr.message}`);
+          // Manually apply the side pause if mergeHoldings itself threw.
+          if (inst.toUpperCase() === 'AMULET') {
+            state.sidePauseUntil.sell = now() + cfg.mergePauseMs;
+          } else {
+            state.sidePauseUntil.buy = now() + cfg.mergePauseMs;
+          }
+        }
       }
       return;
     }
