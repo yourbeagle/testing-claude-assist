@@ -28,6 +28,7 @@ const cfg = {
   monitorMs: num('ORDER_MONITOR_MS', 500),
   heartbeatMs: num('LOG_HEARTBEAT_MS', 10000),
   cooldownMs: num('REPLACE_COOLDOWN_MS', 2000),
+  postOrderCooldownMs: num('POST_ORDER_COOLDOWN_MS', 60000),
   replaceIfDriftTicks: num('REPLACE_IF_DRIFT_TICKS', 1),
   repriceGapTicks: num('REPRICE_GAP_TICKS', 2),
   cancelRetryWaitMs: num('CANCEL_RETRY_WAIT_MS', 60000),
@@ -47,6 +48,7 @@ const cfg = {
 const state = {
   inFlight: false,
   lastActionAt: 0,
+  lastPlacedAt: 0,
 
   // ── Temple auth ──────────────────────────────────────────────────────────
   templeToken: null,
@@ -753,6 +755,11 @@ async function evaluateAndAct(market, oracle, bestBid, bestAsk, knownOrders = nu
     return log(`GATE pending order in-flight side=${state.pendingOrder.side} price=${state.pendingOrder.price} qty=${state.pendingOrder.qty}`);
   }
 
+  const postOrderRemainMs = cfg.postOrderCooldownMs - (now() - state.lastPlacedAt);
+  if (postOrderRemainMs > 0) {
+    return log(`GATE post-order cooldown ${Math.ceil(postOrderRemainMs / 1000)}s remaining`);
+  }
+
   if (inRateLimitBackoff()) {
     return log(`GATE rate-limit backoff until=${new Date(state.rateLimitUntil).toISOString()}`);
   }
@@ -841,6 +848,7 @@ async function evaluateAndAct(market, oracle, bestBid, bestAsk, knownOrders = nu
   try {
     await placeLimit(side, target, targetQty);
     state.lastActionAt = now();
+    state.lastPlacedAt = now();
 
     if (!cfg.dryRun) {
       state.pendingOrder = { side, price: target, qty: targetQty, at: now() };
