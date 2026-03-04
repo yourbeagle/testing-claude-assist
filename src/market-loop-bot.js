@@ -36,7 +36,9 @@ const cfg = {
   waitAppearMs: num('WAIT_APPEAR_MS', 120000),
   pendingHardTimeoutMs: num('PENDING_HARD_TIMEOUT_MS', 600000),
   waitDisappearMs: num('WAIT_DISAPPEAR_MS', 120000),
-  rateLimitBackoffMs: num('RATE_LIMIT_BACKOFF_MS', 10000),
+  // ── reduced default: 20 s instead of 70 s so recovery is faster once the
+  //    root-cause (fewer calls per second) is fixed by the caches below.
+  rateLimitBackoffMs: num('RATE_LIMIT_BACKOFF_MS', 20000),
   mergePauseMs: num('MERGE_PAUSE_MS', 180000),
   minCcRemain: num('MIN_CC_REMAIN', 5),
   minUsdcRemain: num('MIN_USDCX_REMAIN', 1),
@@ -127,11 +129,6 @@ const LOOP_FAIL_COOLDOWN_MS   = num('LOOP_FAIL_COOLDOWN_MS',  30000);
 // Loop session TTL extended from 4 min → 7 min to cut /apikey call frequency.
 const LOOP_SESSION_TTL_MS     = num('LOOP_SESSION_TTL_MS',    7 * 60_000);
 
-// Stale-order auto-cancel: cancel orders older than STALE_ORDER_AGE_MS whose
-// price has drifted >= STALE_DRIFT_TICKS from current oracle or market price.
-const STALE_ORDER_AGE_MS      = num('STALE_ORDER_AGE_MS',     30 * 60_000); // 30 min
-const STALE_DRIFT_TICKS       = num('STALE_DRIFT_TICKS',      2);
-
 const signer = makeSigner(parsePrivateKey(), cfg.partyId);
 
 // ── tiny helpers ─────────────────────────────────────────────────────────────
@@ -161,7 +158,7 @@ function log(msg, data = null) {
   if (data == null) return console.log(`[${ts()}] ${msg}`);
   return console.log(`[${ts()}] ${msg}`, data);
 }
-function ffetch(url, opts = {}, timeoutMs = 8000) {
+function ffetch(url, opts = {}, timeoutMs = 20000) {
   return fetch(url, { ...opts, signal: AbortSignal.timeout(timeoutMs) });
 }
 function sideLower(side) { return String(side || '').toLowerCase(); }
@@ -548,40 +545,6 @@ async function monitorOrders() {
   return orders;
 }
 
-// ── Stale order auto-cancel ──────────────────────────────────────────────────
-// Cancel orders that have been sitting for STALE_ORDER_AGE_MS (default 30 min)
-// AND whose price has drifted >= STALE_DRIFT_TICKS from current oracle/market.
-async function cancelStaleOrders(orders) {
-  const oracle = state.wsOracle ?? state.lastOracle;
-  const market = state.lastMarket;
-  if (!oracle && !market) return; // no reference prices yet
-
-  for (const o of orders) {
-    const born = new Date(o.created_at || o.updated_at || Date.now()).getTime();
-    const ageMs = now() - born;
-    if (ageMs < STALE_ORDER_AGE_MS) continue;
-
-    const orderPrice = Number(o.price);
-    if (!Number.isFinite(orderPrice)) continue;
-
-    const oracleDrift = oracle ? Math.abs(orderPrice - oracle) / cfg.tick : 0;
-    const marketDrift = market ? Math.abs(orderPrice - market) / cfg.tick : 0;
-    const maxDrift = Math.max(oracleDrift, marketDrift);
-
-    if (maxDrift >= STALE_DRIFT_TICKS) {
-      log(`STALE_CANCEL id=${o.order_id} side=${o.side} price=${orderPrice} age=${Math.round(ageMs / 60000)}min oracleDrift=${oracleDrift.toFixed(1)}ticks marketDrift=${marketDrift.toFixed(1)}ticks`);
-      try {
-        await cancelOrder(o.order_id);
-        // Invalidate caches so next cycle sees fresh state
-        state.activeOrdersCache = null;
-        state.activeOrdersCacheAt = 0;
-      } catch (e) {
-        log(`STALE_CANCEL_FAIL id=${o.order_id}: ${e.message}`);
-      }
-    }
-  }
-}
-
 async function waitOrderVisible(expect = null, timeoutMs = cfg.waitAppearMs) {
   const deadline = now() + timeoutMs;
   while (now() < deadline) {
@@ -600,7 +563,7 @@ async function waitOrderVisible(expect = null, timeoutMs = cfg.waitAppearMs) {
       });
       if (hit) return hit;
     }
-    await sleep(1500);
+    await sleep(5000);
   }
   return null;
 }
@@ -612,7 +575,7 @@ async function waitOrderGone(orderId, timeoutMs = cfg.waitDisappearMs) {
     const orders = await getActiveOrders();
     const exists = orders.some((o) => o.order_id === orderId);
     if (!exists) return true;
-    await sleep(1500);
+    await sleep(4000);
   }
   return false;
 }
@@ -933,9 +896,6 @@ async function cycle() {
     const triggerChanged = bookChanged || marketChanged || oracleChanged;
     const heartbeatDue = now() - state.lastHeartbeatAt >= cfg.heartbeatMs;
 
-    // Auto-cancel stale orders every cycle (cheap — just iterates cached list)
-    await cancelStaleOrders(orders);
-
     if (triggerChanged) {
       log(`TRIGGER market:${state.lastMarket ?? '-'}->${market} oracle:${state.lastOracle ?? '-'}->${oracle} bid:${state.lastBid ?? '-'}->${bestBid} ask:${state.lastAsk ?? '-'}->${bestAsk}`);
       state.lastMarket = market;
@@ -959,14 +919,7 @@ async function main() {
   log(`Start loop-bot symbol=${cfg.symbol} dryRun=${cfg.dryRun} pollMs=${cfg.pollMs} heartbeatMs=${cfg.heartbeatMs}`);
   log(`Cache TTLs — ticker:${TICKER_CACHE_MS}ms  activeOrders:${ACTIVE_ORDERS_CACHE_MS}ms  balances:${BALANCES_CACHE_MS}ms  loopSession:${LOOP_SESSION_TTL_MS / 1000}s`);
   log(`Cooldowns  — loginFail:${LOGIN_FAIL_COOLDOWN_MS / 1000}s  loopFail:${LOOP_FAIL_COOLDOWN_MS / 1000}s  rateLimit:${cfg.rateLimitBackoffMs / 1000}s`);
-  log(`Stale cancel — age:${STALE_ORDER_AGE_MS / 60000}min  driftTicks:${STALE_DRIFT_TICKS}`);
-
-  // Pre-warm: login + loop session + oracle WS in parallel before first cycle
   startOracleWs();
-  log('PRE-WARM: authenticating Temple + Loop in parallel...');
-  await Promise.allSettled([templeLogin(), getLoopSession()]);
-  log('PRE-WARM done');
-
   await cycle();
   if (cfg.runOnce) return;
   setInterval(() => cycle(), cfg.pollMs);
