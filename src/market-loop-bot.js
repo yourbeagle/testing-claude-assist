@@ -707,7 +707,10 @@ function targetPrice(side, market, oracle, bestBid = 0, bestAsk = 0) {
     const byBook = round4((bestAsk > 0 ? bestAsk : market) - cfg.tick);
     return round4(Math.min(byOracle, byBook));
   }
-  return round4(o + 2 * cfg.tick);
+  // Buy: oracle + 2 ticks, but never above the top ask (bestAsk) to avoid
+  // exceeding the oracle-permitted price collar.
+  const byOracle = round4(o + 2 * cfg.tick);
+  return bestAsk > 0 ? round4(Math.min(byOracle, bestAsk)) : byOracle;
 }
 
 function isStale(order, side, target) {
@@ -854,14 +857,21 @@ async function evaluateAndAct(market, oracle, bestBid, bestAsk, knownOrders = nu
     const cur = sameSide[0];
     const curPrice = Number(cur.price);
     const gapTicks = Math.abs(target - curPrice) / cfg.tick;
-    if (gapTicks < cfg.repriceGapTicks) {
-      return log(`HOLD ${side} existing @ ${curPrice} (gapTicks=${gapTicks.toFixed(1)})`);
-    }
     const topOfBook = side === 'Buy' ? bestBid : bestAsk;
-    if (topOfBook > 0 && Math.abs(curPrice - topOfBook) <= cfg.tick) {
+    const bookDriftTicks = topOfBook > 0 ? Math.abs(curPrice - topOfBook) / cfg.tick : 0;
+
+    // Cancel immediately if the standing order is > 2 ticks from the current top-of-book
+    if (topOfBook > 0 && bookDriftTicks > 2) {
+      log(`CANCEL_STALE ${side} id=${cur.order_id} price=${curPrice} top-of-book=${topOfBook} drift=${bookDriftTicks.toFixed(1)} ticks`);
+      await cancelOrder(cur.order_id);
+      // Fall through to place a fresh order at the new target
+    } else if (gapTicks < cfg.repriceGapTicks) {
+      return log(`HOLD ${side} existing @ ${curPrice} (gapTicks=${gapTicks.toFixed(1)})`);
+    } else if (topOfBook > 0 && bookDriftTicks <= 1) {
       return log(`HOLD ${side} existing @ ${curPrice} (within 1 tick of top-of-book ${topOfBook})`);
+    } else {
+      log(`PLACE_NEW ${side} first target=${target} existing=${curPrice}`);
     }
-    log(`PLACE_NEW ${side} first target=${target} existing=${curPrice}`);
   }
 
   try {
