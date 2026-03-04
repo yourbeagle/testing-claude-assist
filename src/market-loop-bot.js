@@ -1,5 +1,8 @@
 import 'dotenv/config';
 import crypto from 'crypto';
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import WebSocket from 'ws';
 import * as _forge from 'node-forge';
 import { initializeConfig, createOrderProposal } from '@temple-digital-group/temple-canton-js';
@@ -190,6 +193,24 @@ function makeSigner(privateKeyHex, partyId) {
 // FIX: if a login attempt fails we set loginFailUntil so every subsequent call
 // within LOGIN_FAIL_COOLDOWN_MS throws immediately without hitting the network.
 // Previously each 500 ms cycle retried the auth endpoint on every call.
+function persistJwtToEnv(token) {
+  try {
+    const envPath = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../.env');
+    if (!fs.existsSync(envPath)) return;
+    let content = fs.readFileSync(envPath, 'utf8');
+    if (/^JWT_TOKEN=.*$/m.test(content)) {
+      content = content.replace(/^JWT_TOKEN=.*$/m, `JWT_TOKEN=${token}`);
+    } else {
+      content += `\nJWT_TOKEN=${token}\n`;
+    }
+    fs.writeFileSync(envPath, content, 'utf8');
+    cfg.jwtToken = token;
+    log('JWT_TOKEN saved to .env');
+  } catch (e) {
+    log(`WARN: could not save JWT_TOKEN to .env: ${e.message}`);
+  }
+}
+
 async function templeLogin() {
   if (state.templeToken && now() - state.templeTokenAt < 10 * 60_000) return state.templeToken;
 
@@ -223,6 +244,7 @@ async function templeLogin() {
     state.templeTokenAt = now();
     state.templeLoginPayload = js;
     state.loginFailUntil = 0; // clear any previous cooldown on success
+    persistJwtToEnv(js.access_token);
     return state.templeToken;
   } catch (e) {
     // On any error (network, 401, 5xx) back off before next attempt.
