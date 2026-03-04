@@ -24,10 +24,11 @@ const cfg = {
   maxOrdersPerSide: num('MAX_ORDERS_PER_SIDE', 0),
   minOrderQty: num('MIN_ORDER_QTY', 35),
   tick: num('TICK_SIZE', 0.0001),
-  pollMs: num('POLL_MS', 500),
-  monitorMs: num('ORDER_MONITOR_MS', 1000),
+  pollMs: num('POLL_MS', 250),
+  monitorMs: num('ORDER_MONITOR_MS', 500),
   heartbeatMs: num('LOG_HEARTBEAT_MS', 10000),
-  cooldownMs: num('REPLACE_COOLDOWN_MS', 15000),
+  cooldownMs: num('REPLACE_COOLDOWN_MS', 2000),
+  postOrderCooldownMs: num('POST_ORDER_COOLDOWN_MS', 60000),
   replaceIfDriftTicks: num('REPLACE_IF_DRIFT_TICKS', 1),
   repriceGapTicks: num('REPRICE_GAP_TICKS', 2),
   cancelRetryWaitMs: num('CANCEL_RETRY_WAIT_MS', 60000),
@@ -49,6 +50,7 @@ const cfg = {
 const state = {
   inFlight: false,
   lastActionAt: 0,
+  lastPlacedAt: 0,
 
   // ── Temple auth ──────────────────────────────────────────────────────────
   templeToken: null,
@@ -99,6 +101,12 @@ const state = {
   balancesCache: null,
   balancesCacheAt: 0,
 
+  // ── Slow-path caches (collar + REST oracle) ─────────────────────────────
+  collarCache: null,
+  collarCacheAt: 0,
+  oracleRestCache: null,
+  oracleRestCacheAt: 0,
+
   rateLimitUntil: 0,
   sidePauseUntil: { buy: 0, sell: 0 },
   nextRepriceAt: { buy: 0, sell: 0 },
@@ -107,9 +115,15 @@ const state = {
 };
 
 // TTL constants (ms) — tune via env if needed, sensible defaults here.
-const TICKER_CACHE_MS         = num('TICKER_CACHE_MS',        350);
+// TICKER_CACHE_MS controls ticker+orderbook (2 calls). With 250ms poll this
+// means at most ~4 Temple calls/sec which stays well under rate limits.
+const TICKER_CACHE_MS         = num('TICKER_CACHE_MS',        500);
 const ACTIVE_ORDERS_CACHE_MS  = num('ACTIVE_ORDERS_CACHE_MS', 2000);
-const BALANCES_CACHE_MS       = num('BALANCES_CACHE_MS',      15000);
+const BALANCES_CACHE_MS       = num('BALANCES_CACHE_MS',      5000);
+// Collar + REST oracle change rarely — cache them longer to save API calls.
+// The WS oracle is used as primary oracle source so this is just a fallback.
+const COLLAR_CACHE_MS         = num('COLLAR_CACHE_MS',        60000);
+const ORACLE_REST_CACHE_MS    = num('ORACLE_REST_CACHE_MS',   10000);
 const LOGIN_FAIL_COOLDOWN_MS  = num('LOGIN_FAIL_COOLDOWN_MS', 30000);
 const LOOP_FAIL_COOLDOWN_MS   = num('LOOP_FAIL_COOLDOWN_MS',  30000);
 // Loop session TTL extended from 4 min → 7 min to cut /apikey call frequency.
@@ -333,19 +347,49 @@ async function getActiveOrders() {
   return orders;
 }
 
-// ── Ticker + collar (Temple API) ──────────────────────────────────────────────
-// FIX: cached for TICKER_CACHE_MS (350 ms) — was 4 parallel Temple calls fired
-// on every single 500 ms cycle even when nothing changed.
+// ── Collar (Temple API, slow path — cached COLLAR_CACHE_MS) ──────────────────
+async function getCollar() {
+  if (state.collarCache != null && now() - state.collarCacheAt < COLLAR_CACHE_MS) {
+    return state.collarCache;
+  }
+  const collar = await templeFetch('/api/public/market/order-collar');
+  state.collarCache = Number(collar?.percentage || 0.001);
+  state.collarCacheAt = now();
+  return state.collarCache;
+}
+
+// ── REST oracle (Temple API, slow path — cached ORACLE_REST_CACHE_MS) ────────
+// Only used as fallback when WS oracle is not available.
+async function getOracleRest() {
+  if (state.oracleRestCache != null && now() - state.oracleRestCacheAt < ORACLE_REST_CACHE_MS) {
+    return state.oracleRestCache;
+  }
+  const oracleResp = await templeFetch('/api/crypto/oracle');
+  state.oracleRestCache = Number(oracleResp?.prices?.cc || 0);
+  state.oracleRestCacheAt = now();
+  return state.oracleRestCache;
+}
+
+// ── Ticker + orderbook (Temple API, fast path — cached TICKER_CACHE_MS) ──────
+// Only 2 API calls on the hot path. Collar and REST oracle are fetched on
+// separate, longer cache intervals to stay well under rate limits.
 async function getTickerAndCollar() {
   if (state.tickerCache && now() - state.tickerCacheAt < TICKER_CACHE_MS) {
     return state.tickerCache;
   }
 
-  const [ticker, collar, orderbook, oracleResp] = await Promise.all([
+  // Fast path: ticker + orderbook (2 calls) — these change every trade
+  const [ticker, orderbook] = await Promise.all([
     templeFetch('/api/public/market/ticker', { query: { symbol: cfg.symbol } }),
-    templeFetch('/api/public/market/order-collar'),
     templeFetch('/api/public/market/orderbook', { query: { symbol: cfg.symbol, precision: 4 } }),
-    templeFetch('/api/crypto/oracle'),
+  ]);
+
+  // Slow path: collar + REST oracle fetched from their own caches (0-1 calls
+  // each, only when their longer TTLs expire). REST oracle is skipped entirely
+  // when the WS oracle is already providing real-time data.
+  const [collar, oraclePrice] = await Promise.all([
+    getCollar(),
+    state.wsOracle ? Promise.resolve(state.wsOracle) : getOracleRest(),
   ]);
 
   const ob = orderbook?.orderbook || orderbook || {};
@@ -362,13 +406,13 @@ async function getTickerAndCollar() {
 
   const result = {
     market,
-    oracle: Number(oracleResp?.prices?.cc || 0),
+    oracle: oraclePrice,
     oracleProxy: Number(ticker?.ticker?.vwap_24h || ticker?.ticker?.close_24h || ticker?.ticker?.last_price || 0),
     bestBid,
     bestAsk,
     rawBestBid,
     rawBestAsk,
-    collar: Number(collar?.percentage || 0.001),
+    collar,
   };
   state.tickerCache = result;
   state.tickerCacheAt = now();
@@ -602,12 +646,16 @@ function decideSide(market, oracle, bestBid = 0, bestAsk = 0) {
 }
 
 function targetPrice(side, market, oracle, bestBid = 0, bestAsk = 0) {
+  // Snap oracle to 4dp (tick grid) first. If oracle has 5+ decimal places
+  // (e.g. 0.52525 from WS feed), toFixed(4) inside round4 would round the
+  // 5th decimal UP, pushing the limit price 1 extra tick away from oracle.
+  const o = Math.round(oracle * 10000) / 10000;
   if (side === 'Sell') {
-    const byOracle = round4(oracle - 1 * cfg.tick);
+    const byOracle = round4(o - 1 * cfg.tick);
     const byBook = round4((bestAsk > 0 ? bestAsk : market) - cfg.tick);
     return round4(Math.min(byOracle, byBook));
   }
-  return round4(oracle + 2 * cfg.tick);
+  return round4(o + 2 * cfg.tick);
 }
 
 function isStale(order, side, target) {
@@ -668,6 +716,11 @@ async function evaluateAndAct(market, oracle, bestBid, bestAsk, knownOrders = nu
 
   if (state.pendingOrder) {
     return log(`GATE pending order in-flight side=${state.pendingOrder.side} price=${state.pendingOrder.price} qty=${state.pendingOrder.qty}`);
+  }
+
+  const postOrderRemainMs = cfg.postOrderCooldownMs - (now() - state.lastPlacedAt);
+  if (postOrderRemainMs > 0) {
+    return log(`GATE post-order cooldown ${Math.ceil(postOrderRemainMs / 1000)}s remaining`);
   }
 
   if (inRateLimitBackoff()) {
@@ -752,12 +805,17 @@ async function evaluateAndAct(market, oracle, bestBid, bestAsk, knownOrders = nu
     if (gapTicks < cfg.repriceGapTicks) {
       return log(`HOLD ${side} existing @ ${curPrice} (gapTicks=${gapTicks.toFixed(1)})`);
     }
+    const topOfBook = side === 'Buy' ? bestBid : bestAsk;
+    if (topOfBook > 0 && Math.abs(curPrice - topOfBook) <= cfg.tick) {
+      return log(`HOLD ${side} existing @ ${curPrice} (within 1 tick of top-of-book ${topOfBook})`);
+    }
     log(`PLACE_NEW ${side} first target=${target} existing=${curPrice}`);
   }
 
   try {
     await placeLimit(side, target, targetQty);
     state.lastActionAt = now();
+    state.lastPlacedAt = now();
 
     if (!cfg.dryRun) {
       state.pendingOrder = { side, price: target, qty: targetQty, at: now() };
